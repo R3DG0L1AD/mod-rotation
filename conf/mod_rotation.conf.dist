@@ -136,3 +136,10 @@ Rotation.EnergyDump.Threshold = 60
 Rotation.Heal.InjuredPct = 85
 Rotation.Heal.LowPct = 60
 Rotation.Heal.UrgentPct = 35
+
+#    Rotation.AssistSurveyMs
+#        Test aid: when > 0, every player/bot in combat logs its suggested next spell
+#        (ROTSURVEY lines) at this interval. Keep 0 on live.
+#        Default: 0
+
+Rotation.AssistSurveyMs = 0

@@ -20,6 +20,7 @@ namespace ModRotation
         bool   AutoLearn         = true;
         bool   AssistBroadcast   = true;
         bool   AssistPredict     = true;
+        uint32 AssistSurveyMs = 0;
         uint32 AssistPredictIntervalMs = 400;
         bool   Announce          = false;
         std::string AnnounceMessage;

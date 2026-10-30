@@ -5,6 +5,9 @@
 
 #include "Rotation.h"
 
+#include <algorithm>
+#include <vector>
+
 #include "Cell.h"
 #include "CellImpl.h"
 #include "Chat.h"
@@ -38,6 +41,8 @@ Settings config;
 // per-player state lives in Player::CustomData.
 static thread_local bool   t_dryRun    = false;
 static thread_local uint32 t_predicted = 0;
+// Collect mode (47322 tooltip): every known spell the priority list evaluates, in order.
+static thread_local std::vector<uint32>* t_collect = nullptr;
 
 bool IsDryRun() { return t_dryRun; }
 
@@ -47,6 +52,8 @@ struct RotationAssistData : public DataMap::Base
     uint32 sinceTick  = 0;
     uint32 sinceSend  = 0;
     uint32 lastSpell  = 0;
+    uint8  listTree   = 255;   // tree whose priority list was last sent (255 = never)
+    uint32 sinceSurvey = 0;
 };
 
 static char const* const ASSIST_KEY = "mod-rotation-assist";
@@ -164,6 +171,13 @@ static bool ReadyToCast(Player* p, SpellInfo const* info)
 // is ready while the GCD spins)? Records the first hit and stops the chain.
 static bool Predict(Player* p, Unit* target, SpellInfo const* info)
 {
+    if (t_collect)
+    {
+        if (info && p->HasSpell(info->Id) && t_collect->size() < 24 &&
+            std::find(t_collect->begin(), t_collect->end(), info->Id) == t_collect->end())
+            t_collect->push_back(info->Id);
+        return false;   // keep walking the whole list
+    }
     if (!info || !target)
         return false;
     if (p->HasSpellCooldown(info->Id))
@@ -368,6 +382,55 @@ static uint32 PredictNext(Player* p, uint8& tree)
     return t_predicted;
 }
 
+// "CMROTL\t<tree>,<class>,<id>,<id>..." : the spec's priority list for the 47322 tooltip.
+static void SendList(Player* p, RotationAssistData* d)
+{
+    if (!config.AssistBroadcast || !p->GetSession())
+        return;
+    Ctx c;
+    BuildCtx(p, c);
+    if (!c.target)
+        c.target = p->GetSelectedUnit() ? p->GetSelectedUnit() : p;
+    std::vector<uint32> list;
+    t_collect = &list;
+    t_dryRun = true;
+    Dispatch(c);
+    t_dryRun = false;
+    t_collect = nullptr;
+
+    std::string msg = "CMROTL\t" + std::to_string(uint32(c.tree)) + "," + std::to_string(uint32(p->getClass()));
+    for (uint32 id : list)
+    {
+        std::string part = "," + std::to_string(id);
+        if (msg.size() + part.size() > 250)
+            break;
+        msg += part;
+    }
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_ADDON, LANG_ADDON, p, p, msg);
+    p->GetSession()->SendPacket(&data);
+    d->listTree = c.tree;
+}
+
+// Test aid (Rotation.AssistSurveyMs > 0, t4 only): logs what every player or bot in
+// combat would be suggested, so all 30 specs can be checked from the server log.
+static void Survey(Player* p, RotationAssistData* d, uint32 diff)
+{
+    if (!config.AssistSurveyMs || !p->IsAlive() || !p->IsInCombat())
+        return;
+    d->sinceSurvey += diff;
+    if (d->sinceSurvey < config.AssistSurveyMs)
+        return;
+    d->sinceSurvey = 0;
+    uint8 tree = 0;
+    uint32 next = PredictNext(p, tree);
+    SpellInfo const* info = next ? sSpellMgr->GetSpellInfo(next) : nullptr;
+    Unit* sel = p->GetSelectedUnit();
+    LOG_INFO("module", "ROTSURVEY class={} tree={} role={} lvl={} acct={} spell={} name={} target={}",
+        uint32(p->getClass()), uint32(tree), RoleFor(p, tree), uint32(p->GetLevel()), p->GetSession() ? p->GetSession()->GetAccountId() : 0,
+        next, info ? info->SpellName[0] : "-", sel ? sel->GetName() : "-");
+}
+
 static void SendPrediction(Player* p, RotationAssistData* d, bool force)
 {
     uint8 tree = 0;
@@ -404,6 +467,9 @@ static void ExecuteRotation(Player* p)
 
 void AssistTick(Player* player, uint32 diff)
 {
+    if (config.AssistSurveyMs)
+        Survey(player, AssistData(player), diff);
+
     RotationAssistData* d = player->CustomData.Get<RotationAssistData>(ASSIST_KEY);
     if (!d || !d->subscribed)
         return;
@@ -413,6 +479,9 @@ void AssistTick(Player* player, uint32 diff)
     if (d->sinceTick < config.AssistPredictIntervalMs)
         return;
     d->sinceTick = 0;
+
+    if (d->listTree != ClassicTree(player))
+        SendList(player, d);
 
     Unit* sel = player->GetSelectedUnit();
     bool hostile = sel && sel->IsAlive() && player->IsValidAttackTarget(sel);
@@ -432,7 +501,9 @@ void AssistTick(Player* player, uint32 diff)
 
 void AssistSubscribe(Player* player)
 {
-    AssistData(player)->subscribed = true;
+    RotationAssistData* d = AssistData(player);
+    d->subscribed = true;
+    d->listTree = 255;   // resend the priority list on the next tick
 }
 } // namespace ModRotation
 
@@ -451,6 +522,7 @@ public:
         config.AssistBroadcast     = sConfigMgr->GetOption<bool>("Rotation.AssistBroadcast", true);
         config.AssistPredict       = sConfigMgr->GetOption<bool>("Rotation.AssistPredict", true);
         config.AssistPredictIntervalMs = sConfigMgr->GetOption<uint32>("Rotation.AssistPredict.IntervalMs", 400);
+        config.AssistSurveyMs = sConfigMgr->GetOption<uint32>("Rotation.AssistSurveyMs", 0);
         config.Announce            = sConfigMgr->GetOption<bool>("Rotation.Announce", false);
         config.AnnounceMessage     = sConfigMgr->GetOption<std::string>("Rotation.Announce.Message",
             "One-button |cff4CFF00Rotation|r module active: place the Rotation spell from your spellbook on your action bar.");
