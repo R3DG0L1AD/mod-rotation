@@ -9,6 +9,7 @@
 #include "CellImpl.h"
 #include "Chat.h"
 #include "Config.h"
+#include "DBCStores.h"
 #include "CreatureAI.h"
 #include "Duration.h"
 #include "GridNotifiers.h"
@@ -25,34 +26,98 @@ namespace ModRotation
 {
 Settings config;
 
-uint8 s_pressTree = 0; // ACM assist bridge: dominant tree of the press in flight
-
 // ---------------------------------------------------------------------------
-// ACM assist bridge (FamWoW 2026-10-30): broadcast the spell the rotation just
-// cast to the player's own client, so the Action Combat Mode addon's
-// assisted-combat icon (C_AssistedCombat.GetNextCastSpell shim in
-// Compat335.lua) can show it over the crosshair. Wire format is a
-// CHAT_MSG_ADDON SMSG_MESSAGECHAT with text "CMROT\t<spellId>,<tree>,<class>"
-// (LANG_ADDON); the client splits on the tab. Broadcast only the FIRST cast of
-// each trigger press (the rotation's top-priority action).
-static bool   s_pressBroadcastPending = false;
+// ACM assist bridge v2 (WoWbot 2026-10-30, ACM port).
+// The server tells the player's own client which spell the rotation will cast
+// NEXT, so the Action Combat Mode addon can show it beside the crosshair and
+// highlight it on the action bars (retail Assisted Highlight behaviour).
+// Wire: CHAT_MSG_ADDON, LANG_ADDON, built with ChatHandler::BuildChatPacket
+// (correct 3.3.5 layout), text "CMROT\t<spellId>,<tree>,<class>,1,<role>"
+// where role is H/T/D. spellId 0 clears the suggestion.
+// Per-press state is thread_local (map updates run on several threads);
+// per-player state lives in Player::CustomData.
+static thread_local bool   t_dryRun    = false;
+static thread_local uint32 t_predicted = 0;
 
-static void BroadcastRotationSpell(Player* p, uint32 spellId, uint8 tree)
+bool IsDryRun() { return t_dryRun; }
+
+struct RotationAssistData : public DataMap::Base
+{
+    bool   subscribed = false;
+    uint32 sinceTick  = 0;
+    uint32 sinceSend  = 0;
+    uint32 lastSpell  = 0;
+};
+
+static char const* const ASSIST_KEY = "mod-rotation-assist";
+
+static RotationAssistData* AssistData(Player* p)
+{
+    return p->CustomData.GetDefault<RotationAssistData>(ASSIST_KEY);
+}
+
+// Dominant CLASS talent tree (0..2). FamWoW's 4th tree is a separate system,
+// so it never decides the rotation spec.
+uint8 ClassicTree(Player* p)
+{
+    uint8 t = p->GetMostPointsTalentTree();
+    if (t < 3)
+        return t;
+
+    uint32 pts[3] = { 0, 0, 0 };
+    for (auto const& kv : p->GetTalentMap())
+    {
+        if (kv.second->State == PLAYERSPELL_REMOVED || !kv.second->IsInSpec(p->GetActiveSpec()))
+            continue;
+        TalentEntry const* ti = sTalentStore.LookupEntry(kv.second->talentID);
+        if (!ti)
+            continue;
+        TalentTabEntry const* tab = sTalentTabStore.LookupEntry(ti->TalentTab);
+        if (!tab || tab->tabpage >= 3)
+            continue;
+        for (uint8 r = 0; r < MAX_TALENT_RANK; ++r)
+            if (ti->RankID[r] && kv.first == ti->RankID[r])
+            {
+                pts[tab->tabpage] += r + 1;
+                break;
+            }
+    }
+    uint8 best = 0;
+    for (uint8 i = 1; i < 3; ++i)
+        if (pts[i] > pts[best])
+            best = i;
+    return best;
+}
+
+static char RoleFor(Player* p, uint8 tree)
+{
+    switch (p->getClass())
+    {
+        case CLASS_WARRIOR:      return tree == 2 ? 'T' : 'D';
+        case CLASS_PALADIN:      return tree == 0 ? 'H' : (tree == 1 ? 'T' : 'D');
+        case CLASS_DEATH_KNIGHT: return tree == 0 ? 'T' : 'D';
+        case CLASS_PRIEST:       return tree == 2 ? 'D' : 'H';
+        case CLASS_SHAMAN:       return tree == 2 ? 'H' : 'D';
+        case CLASS_DRUID:
+            if (tree == 2)
+                return 'H';
+            if (tree == 1 && (p->GetShapeshiftForm() == FORM_BEAR || p->GetShapeshiftForm() == FORM_DIREBEAR))
+                return 'T';
+            return 'D';
+        default:                 return 'D';
+    }
+}
+
+static void SendAssist(Player* p, uint32 spellId, uint8 tree)
 {
     if (!config.AssistBroadcast || !p || !p->GetSession())
         return;
 
-    WorldPacket data(SMSG_MESSAGECHAT, 64);
-    data << uint8(CHAT_MSG_ADDON);
-    data << uint32(LANG_ADDON);
-    data << p->GetPackGUID();
-    data << uint32(0);          // senderUnk
-    data << uint8(0);           // empty packed target GUID
     std::string msg = "CMROT\t" + std::to_string(spellId) + "," +
                       std::to_string(uint32(tree)) + "," +
-                      std::to_string(uint32(p->getClass()));
-    data << msg;
-    data << uint8(0);           // chatTag
+                      std::to_string(uint32(p->getClass())) + ",1," + RoleFor(p, tree);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_ADDON, LANG_ADDON, p, p, msg);
     p->GetSession()->SendPacket(&data);
 }
 
@@ -95,22 +160,42 @@ static bool ReadyToCast(Player* p, SpellInfo const* info)
     return CanPayCost(p, info);
 }
 
+// Dry run: would this spell be cast now (ignoring the GCD, so the suggestion
+// is ready while the GCD spins)? Records the first hit and stops the chain.
+static bool Predict(Player* p, Unit* target, SpellInfo const* info)
+{
+    if (!info || !target)
+        return false;
+    if (p->HasSpellCooldown(info->Id))
+        return false;
+    if (info->CheckShapeshift(p->GetShapeshiftForm()) != SPELL_CAST_OK)
+        return false;
+    if (!CanPayCost(p, info))
+        return false;
+    if (target != p)
+    {
+        float maxR = info->GetMaxRange(!p->IsValidAttackTarget(target), p);
+        if (maxR > 0.0f && !p->IsWithinCombatRange(target, maxR + 1.0f))
+            return false;
+    }
+    if (!t_predicted)
+        t_predicted = info->Id;
+    return true;
+}
+
 bool TryCast(Player* p, Unit* target, uint32 spellId)
 {
     if (!spellId || !target)
         return false;
 
     SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+    if (t_dryRun)
+        return Predict(p, target, info);
+
     if (!ReadyToCast(p, info))
         return false;
 
-    bool ok = p->CastSpell(target, spellId, false) == SPELL_CAST_OK;
-    if (ok && s_pressBroadcastPending)
-    {
-        s_pressBroadcastPending = false;
-        BroadcastRotationSpell(p, spellId, s_pressTree);
-    }
-    return ok;
+    return p->CastSpell(target, spellId, false) == SPELL_CAST_OK;
 }
 
 bool TryCastRank(Player* p, Unit* target, uint32 firstRankId)
@@ -125,6 +210,9 @@ bool TryCastAt(Player* p, Unit* where, uint32 firstRankId)
         return false;
 
     SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
+    if (t_dryRun)
+        return Predict(p, where, info);
+
     if (!ReadyToCast(p, info))
         return false;
 
@@ -155,7 +243,7 @@ bool IsBleedImmune(Unit* target)
 
 void PetAttack(Ctx& c)
 {
-    if (!c.target)
+    if (!c.target || t_dryRun)
         return;
 
     if (Pet* pet = c.me->GetPet())
@@ -165,6 +253,9 @@ void PetAttack(Ctx& c)
 
 void EngageMelee(Ctx& c)
 {
+    if (t_dryRun)
+        return;
+
     if (c.target && c.me->GetVictim() != c.target)
         c.me->Attack(c.target, true);
 
@@ -173,6 +264,9 @@ void EngageMelee(Ctx& c)
 
 void EngageRanged(Ctx& c)
 {
+    if (t_dryRun)
+        return;
+
     if (!c.target)
         return;
 
@@ -217,17 +311,8 @@ static uint32 CountEnemiesAround(Player* p, Unit* center, float radius)
     return count;
 }
 
-static void ExecuteRotation(Player* p)
+static void BuildCtx(Player* p, Ctx& c)
 {
-    if (!p->IsAlive())
-        return;
-
-    // Ne pas couper une incantation ou une canalisation en cours
-    // (le Tir automatique n'est pas bloquant).
-    if (p->IsNonMeleeSpellCast(false, false, true))
-        return;
-
-    Ctx c;
     c.me = p;
 
     Unit* sel = p->GetSelectedUnit();
@@ -248,13 +333,12 @@ static void ExecuteRotation(Player* p)
         c.enemies = CountEnemiesAround(p, c.target, config.AoeRadius);
     }
 
-    c.tree = p->GetMostPointsTalentTree();
+    c.tree = ClassicTree(p);
+}
 
-    // ACM assist bridge: mark this press as broadcastable (first cast wins).
-    s_pressTree = c.tree;
-    s_pressBroadcastPending = true;
-
-    switch (p->getClass())
+static void Dispatch(Ctx& c)
+{
+    switch (c.me->getClass())
     {
         case CLASS_WARRIOR:      Warrior(c);     break;
         case CLASS_PALADIN:      Paladin(c);     break;
@@ -268,6 +352,87 @@ static void ExecuteRotation(Player* p)
         case CLASS_DRUID:        Druid(c);       break;
         default: break;
     }
+}
+
+// Runs the same priority list without casting and returns the spell it
+// would cast next (0 = nothing usable).
+static uint32 PredictNext(Player* p, uint8& tree)
+{
+    Ctx c;
+    BuildCtx(p, c);
+    tree = c.tree;
+    t_dryRun = true;
+    t_predicted = 0;
+    Dispatch(c);
+    t_dryRun = false;
+    return t_predicted;
+}
+
+static void SendPrediction(Player* p, RotationAssistData* d, bool force)
+{
+    uint8 tree = 0;
+    uint32 next = PredictNext(p, tree);
+    if (force || next != d->lastSpell || d->sinceSend >= 2000)
+    {
+        SendAssist(p, next, tree);
+        d->lastSpell = next;
+        d->sinceSend = 0;
+    }
+}
+
+static void ExecuteRotation(Player* p)
+{
+    if (!p->IsAlive())
+        return;
+
+    // Ne pas couper une incantation ou une canalisation en cours
+    // (le Tir automatique n'est pas bloquant).
+    if (!p->IsNonMeleeSpellCast(false, false, true))
+    {
+        Ctx c;
+        BuildCtx(p, c);
+        Dispatch(c);
+    }
+
+    if (config.AssistBroadcast && config.AssistPredict)
+    {
+        RotationAssistData* d = AssistData(p);
+        d->subscribed = true;
+        SendPrediction(p, d, true);
+    }
+}
+
+void AssistTick(Player* player, uint32 diff)
+{
+    RotationAssistData* d = player->CustomData.Get<RotationAssistData>(ASSIST_KEY);
+    if (!d || !d->subscribed)
+        return;
+
+    d->sinceTick += diff;
+    d->sinceSend += diff;
+    if (d->sinceTick < config.AssistPredictIntervalMs)
+        return;
+    d->sinceTick = 0;
+
+    Unit* sel = player->GetSelectedUnit();
+    bool hostile = sel && sel->IsAlive() && player->IsValidAttackTarget(sel);
+    if (!player->IsAlive() || (!hostile && !player->IsInCombat()))
+    {
+        if (d->lastSpell)
+        {
+            SendAssist(player, 0, ClassicTree(player));
+            d->lastSpell = 0;
+            d->sinceSend = 0;
+        }
+        return;
+    }
+
+    SendPrediction(player, d, false);
+}
+
+void AssistSubscribe(Player* player)
+{
+    AssistData(player)->subscribed = true;
 }
 } // namespace ModRotation
 
@@ -284,6 +449,8 @@ public:
         config.SpellId             = sConfigMgr->GetOption<uint32>("Rotation.SpellId", 47322);
         config.AutoLearn           = sConfigMgr->GetOption<bool>("Rotation.AutoLearn", true);
         config.AssistBroadcast     = sConfigMgr->GetOption<bool>("Rotation.AssistBroadcast", true);
+        config.AssistPredict       = sConfigMgr->GetOption<bool>("Rotation.AssistPredict", true);
+        config.AssistPredictIntervalMs = sConfigMgr->GetOption<uint32>("Rotation.AssistPredict.IntervalMs", 400);
         config.Announce            = sConfigMgr->GetOption<bool>("Rotation.Announce", false);
         config.AnnounceMessage     = sConfigMgr->GetOption<std::string>("Rotation.Announce.Message",
             "One-button |cff4CFF00Rotation|r module active: place the Rotation spell from your spellbook on your action bar.");
@@ -327,6 +494,21 @@ public:
             if (Player* p = ObjectAccessor::FindPlayer(guid))
                 ExecuteRotation(p);
         }, Milliseconds(1));
+    }
+
+    // ACM assist: refresh the next-spell suggestion for subscribed players.
+    void OnPlayerUpdate(Player* player, uint32 diff) override
+    {
+        if (config.Enabled && config.AssistBroadcast && config.AssistPredict)
+            AssistTick(player, diff);
+    }
+
+    // ACM assist handshake: the addon whispers itself "CMROTSUB" on login.
+    bool OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 language, std::string& msg, Player* /*receiver*/) override
+    {
+        if (language == LANG_ADDON && msg.compare(0, 8, "CMROTSUB") == 0)
+            AssistSubscribe(player);
+        return true;
     }
 };
 

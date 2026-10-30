@@ -85,7 +85,7 @@ void Hunter(Ctx& c)
     // Trop près pour tirer : Attaque du raptor
     if (c.inMelee)
     {
-        if (c.me->GetVictim() != c.target)
+        if (!IsDryRun() && c.me->GetVictim() != c.target)
             c.me->Attack(c.target, true);
 
         if (!c.me->GetCurrentSpell(CURRENT_MELEE_SPELL))

@@ -19,6 +19,8 @@ namespace ModRotation
         uint32 SpellId           = 47322;
         bool   AutoLearn         = true;
         bool   AssistBroadcast   = true;
+        bool   AssistPredict     = true;
+        uint32 AssistPredictIntervalMs = 400;
         bool   Announce          = false;
         std::string AnnounceMessage;
         uint32 AoeThreshold      = 2;
@@ -32,7 +34,10 @@ namespace ModRotation
 
     extern Settings config;
 
-    extern uint8 s_pressTree; // ACM assist bridge: dominant tree of the press in flight
+    bool  IsDryRun();                 // ACM assist: true while predicting (no side effects)
+    uint8 ClassicTree(Player* p);     // dominant class tree 0..2 (ignores the FamWoW 4th tree)
+    void  AssistTick(Player* p, uint32 diff);
+    void  AssistSubscribe(Player* p);
 
     // Contexte d'une exécution de rotation (un appui sur le bouton).
     struct Ctx

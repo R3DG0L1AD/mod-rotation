@@ -44,6 +44,19 @@ Rotation.AutoLearn = 1
 
 Rotation.AssistBroadcast = 1
 
+#    Rotation.AssistPredict
+#        Description: Send the spell the rotation would cast NEXT (dry run of the
+#                     same priority list) instead of the one it just cast, and
+#                     refresh it while the player fights. Players subscribe by
+#                     pressing the Rotation spell once or via the ACM addon.
+#            Default: 1 - (enabled)
+#    Rotation.AssistPredict.IntervalMs
+#        Description: How often (ms) the suggestion is recomputed in combat.
+#            Default: 400
+
+Rotation.AssistPredict = 1
+Rotation.AssistPredict.IntervalMs = 400
+
 #
 #    Rotation.Announce
 #        Description: Shows a message to players on login.
