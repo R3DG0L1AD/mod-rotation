@@ -34,7 +34,7 @@ Settings config;
 // The server tells the player's own client which spell the rotation will cast
 // NEXT, so the Action Combat Mode addon can show it beside the crosshair and
 // highlight it on the action bars (retail Assisted Highlight behaviour).
-// Wire: CHAT_MSG_ADDON, LANG_ADDON, built with ChatHandler::BuildChatPacket
+// Wire: CHAT_MSG_WHISPER (self) + LANG_ADDON, built with ChatHandler::BuildChatPacket. NEVER CHAT_MSG_ADDON: it goes out as type 0xFF and the 3.3.5 client hits SErrDisplayAppFatal in CGChat::AddChatMessage
 // (correct 3.3.5 layout), text "CMROT\t<spellId>,<tree>,<class>,1,<role>"
 // where role is H/T/D. spellId 0 clears the suggestion.
 // Per-press state is thread_local (map updates run on several threads);
@@ -124,7 +124,7 @@ static void SendAssist(Player* p, uint32 spellId, uint8 tree)
                       std::to_string(uint32(tree)) + "," +
                       std::to_string(uint32(p->getClass())) + ",1," + RoleFor(p, tree);
     WorldPacket data;
-    ChatHandler::BuildChatPacket(data, CHAT_MSG_ADDON, LANG_ADDON, p, p, msg);
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, p, p, msg); // wire type must be < CHAT_MSG_MAX: CHAT_MSG_ADDON (0xFF) is a client Fatal Condition
     p->GetSession()->SendPacket(&data);
 }
 
@@ -407,7 +407,7 @@ static void SendList(Player* p, RotationAssistData* d)
         msg += part;
     }
     WorldPacket data;
-    ChatHandler::BuildChatPacket(data, CHAT_MSG_ADDON, LANG_ADDON, p, p, msg);
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, p, p, msg); // wire type must be < CHAT_MSG_MAX: CHAT_MSG_ADDON (0xFF) is a client Fatal Condition
     p->GetSession()->SendPacket(&data);
     d->listTree = c.tree;
 }
