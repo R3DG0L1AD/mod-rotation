@@ -18,6 +18,7 @@ namespace ModRotation
         bool   Enabled           = true;
         uint32 SpellId           = 47322;
         bool   AutoLearn         = true;
+        bool   AssistBroadcast   = true;
         bool   Announce          = false;
         std::string AnnounceMessage;
         uint32 AoeThreshold      = 2;
@@ -30,6 +31,8 @@ namespace ModRotation
     };
 
     extern Settings config;
+
+    extern uint8 s_pressTree; // ACM assist bridge: dominant tree of the press in flight
 
     // Contexte d'une exécution de rotation (un appui sur le bouton).
     struct Ctx

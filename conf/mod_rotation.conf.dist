@@ -36,6 +36,14 @@ Rotation.SpellId = 47322
 
 Rotation.AutoLearn = 1
 
+#    Rotation.AssistBroadcast
+#        Description: Broadcast the spell the rotation casts to the player's client
+#                     (addon CHAT_MSG_ADDON "CMROT") so the Action Combat Mode
+#                     assisted-combat crosshair icon can display it.
+#            Default: 1 - (enabled)
+
+Rotation.AssistBroadcast = 1
+
 #
 #    Rotation.Announce
 #        Description: Shows a message to players on login.

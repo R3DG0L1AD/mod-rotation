@@ -13,14 +13,49 @@
 #include "Duration.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Language.h"
 #include "ObjectAccessor.h"
+#include "Opcodes.h"
 #include "Pet.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "WorldPacket.h"
 
 namespace ModRotation
 {
 Settings config;
+
+uint8 s_pressTree = 0; // ACM assist bridge: dominant tree of the press in flight
+
+// ---------------------------------------------------------------------------
+// ACM assist bridge (FamWoW 2026-10-30): broadcast the spell the rotation just
+// cast to the player's own client, so the Action Combat Mode addon's
+// assisted-combat icon (C_AssistedCombat.GetNextCastSpell shim in
+// Compat335.lua) can show it over the crosshair. Wire format is a
+// CHAT_MSG_ADDON SMSG_MESSAGECHAT with text "CMROT\t<spellId>,<tree>,<class>"
+// (LANG_ADDON); the client splits on the tab. Broadcast only the FIRST cast of
+// each trigger press (the rotation's top-priority action).
+static bool   s_pressBroadcastPending = false;
+
+static void BroadcastRotationSpell(Player* p, uint32 spellId, uint8 tree)
+{
+    if (!config.AssistBroadcast || !p || !p->GetSession())
+        return;
+
+    WorldPacket data(SMSG_MESSAGECHAT, 64);
+    data << uint8(CHAT_MSG_ADDON);
+    data << uint32(LANG_ADDON);
+    data << p->GetPackGUID();
+    data << uint32(0);          // senderUnk
+    data << uint8(0);           // empty packed target GUID
+    std::string msg = "CMROT\t" + std::to_string(spellId) + "," +
+                      std::to_string(uint32(tree)) + "," +
+                      std::to_string(uint32(p->getClass()));
+    data << msg;
+    data << uint8(0);           // chatTag
+    p->GetSession()->SendPacket(&data);
+}
+
 
 uint32 MaxRank(Player* p, uint32 firstRankId)
 {
@@ -69,7 +104,13 @@ bool TryCast(Player* p, Unit* target, uint32 spellId)
     if (!ReadyToCast(p, info))
         return false;
 
-    return p->CastSpell(target, spellId, false) == SPELL_CAST_OK;
+    bool ok = p->CastSpell(target, spellId, false) == SPELL_CAST_OK;
+    if (ok && s_pressBroadcastPending)
+    {
+        s_pressBroadcastPending = false;
+        BroadcastRotationSpell(p, spellId, s_pressTree);
+    }
+    return ok;
 }
 
 bool TryCastRank(Player* p, Unit* target, uint32 firstRankId)
@@ -209,6 +250,10 @@ static void ExecuteRotation(Player* p)
 
     c.tree = p->GetMostPointsTalentTree();
 
+    // ACM assist bridge: mark this press as broadcastable (first cast wins).
+    s_pressTree = c.tree;
+    s_pressBroadcastPending = true;
+
     switch (p->getClass())
     {
         case CLASS_WARRIOR:      Warrior(c);     break;
@@ -238,6 +283,7 @@ public:
         config.Enabled             = sConfigMgr->GetOption<bool>("Rotation.Enable", true);
         config.SpellId             = sConfigMgr->GetOption<uint32>("Rotation.SpellId", 47322);
         config.AutoLearn           = sConfigMgr->GetOption<bool>("Rotation.AutoLearn", true);
+        config.AssistBroadcast     = sConfigMgr->GetOption<bool>("Rotation.AssistBroadcast", true);
         config.Announce            = sConfigMgr->GetOption<bool>("Rotation.Announce", false);
         config.AnnounceMessage     = sConfigMgr->GetOption<std::string>("Rotation.Announce.Message",
             "One-button |cff4CFF00Rotation|r module active: place the Rotation spell from your spellbook on your action bar.");
